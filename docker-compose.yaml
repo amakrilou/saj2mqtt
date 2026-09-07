@@ -9,6 +9,9 @@ services:
     container_name: saj2mqtt
     expose:
       - "5000"
+      - "502"
     ports:
       - "5000:5000"
+      # Modbus TCP, polled by the E-MVP edge server.
+      - "502:502"
     command: npm run start
