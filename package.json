@@ -2,6 +2,7 @@
   "dependencies": {
     "axios": "^1.2.5",
     "dotenv": "^16.0.3",
+    "modbus-serial": "^8.0.25",
     "mqtt": "^4.3.7",
     "ts-node": "^10.9.1",
     "typescript": "^4.9.4"
@@ -9,7 +10,8 @@
   "scripts": {
     "dev": "nodemon --watch 'src/**/*' -e ts,tsx --exec 'ts-node' ./src/index.ts",
     "start": "ts-node dist/index.js",
-    "build": "tsc -p ."
+    "build": "tsc -p .",
+    "test": "ts-node src/modbus.test.ts"
   },
   "devDependencies": {
     "@types/node": "^18.11.18",
