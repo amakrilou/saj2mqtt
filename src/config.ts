@@ -18,11 +18,17 @@ export const MQTT_BROKER_PWD = env.MQTT_BROKER_PWD || "password";
 
 export const MQTT_SAJ2MQTT_TOPIC = env.MQTT_SAJ2MQTT_TOPIC || "saj2mqtt/state";
 
-// Modbus TCP server. The inverter is served as a Chint DTSU666-compatible slave
-// so the E-MVP edge can poll it as a power meter (see src/modbus.ts).
+// Modbus TCP server. The inverter is served as a SunSpec device (Common model 1
+// + three-phase inverter model 103) so the E-MVP edge can poll it as a real
+// solar inverter, not a meter (see src/modbus.ts).
 export const MODBUS_TCP_HOST = env.MODBUS_TCP_HOST || "0.0.0.0";
 export const MODBUS_TCP_PORT = Number(env.MODBUS_TCP_PORT) || 502;
 export const MODBUS_UNIT_ID = Number(env.MODBUS_UNIT_ID) || 1;
+
+// SunSpec base register: the holding-register address where the "SunS" marker
+// and model chain begin. 40000 is the near-universal default; the edge's SunSpec
+// driver must read from the same base.
+export const MODBUS_BASE_REGISTER = Number(env.MODBUS_BASE_REGISTER) || 40000;
 
 // How long a reading stays servable. Past this the server answers with a Modbus
 // exception rather than stale values, so the poller reports a communication

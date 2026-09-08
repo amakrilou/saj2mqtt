@@ -1,20 +1,21 @@
 import assert from "node:assert/strict";
 import ModbusRTU, { ServerTCP } from "modbus-serial";
 import { buildRegisters, resetSnapshot, updateSnapshot, vector } from "./modbus";
-import { MODBUS_UNIT_ID } from "./config";
+import { MODBUS_BASE_REGISTER, MODBUS_UNIT_ID } from "./config";
 import { formatPayload } from "./formatters/state";
 import { SAJState } from "./types";
 
 /**
- * Self-check for the DTSU666 register encoding and the Modbus TCP server.
+ * Self-check for the SunSpec register encoding and the Modbus TCP server.
  *
- * Run with `npm test`. Deliberately plain asserts and a real socket -- the
- * encoding (float32 + word order + per-field scaling) and the edge's exact
- * block reads are the parts that silently produce wrong numbers, so they are
- * checked against a real client rather than a mock.
+ * Run with `npm test`. Plain asserts and a real socket -- the encoding
+ * (int16 + scale factor + acc32 + model layout) and the client's block reads
+ * are the parts that silently produce wrong numbers, so they are checked
+ * against a real Modbus client rather than a mock.
  */
 
 const TEST_PORT = 15502;
+const BASE = MODBUS_BASE_REGISTER;
 
 // A real status.php response, captured from the inverter.
 const RAW_PAYLOAD =
@@ -28,14 +29,39 @@ const ONLINE: SAJState = {
   ...formatPayload(RAW_PAYLOAD),
 };
 
-/** Decodes a float32 from a big-endian ABCD register pair. */
-function decodeFloat32(words: number[]): number {
-  const buf = Buffer.alloc(4);
-  buf.writeUInt16BE(words[0], 0);
-  buf.writeUInt16BE(words[1], 2);
-  return buf.readFloatBE(0);
-}
+// SunSpec device layout offsets from BASE.
+const M1_HDR = BASE + 2; // Common model header
+const M103_HDR = BASE + 2 + 2 + 66; // after marker(2)+m1 hdr(2)+m1 data(66)
+const D = M103_HDR + 2; // model 103 data start
+// Model 103 point offsets within the data block.
+const P = {
+  AphA: 1,
+  A_SF: 4,
+  PhVphA: 8,
+  V_SF: 11,
+  W: 12,
+  W_SF: 13,
+  Hz: 14,
+  Hz_SF: 15,
+  WH: 22,
+  WH_SF: 24,
+  St: 36,
+} as const;
 
+function i16(v: number): number {
+  return v > 0x7fff ? v - 0x10000 : v;
+}
+function sf(value: number, scale: number): number {
+  return i16(value) * Math.pow(10, i16(scale));
+}
+function acc32(hi: number, lo: number): number {
+  return hi * 0x10000 + lo;
+}
+// acc32 value scaled by its (16-bit) scale factor -- must NOT narrow the 32-bit
+// accumulator with i16.
+function accSf(hi: number, lo: number, scale: number): number {
+  return acc32(hi, lo) * Math.pow(10, i16(scale));
+}
 function close(value: number, expected: number, what: string) {
   assert.ok(
     Math.abs(value - expected) < 0.01,
@@ -44,39 +70,42 @@ function close(value: number, expected: number, what: string) {
 }
 
 function checkEncoding() {
-  const regs = buildRegisters(ONLINE);
-  assert.ok(regs, "a complete online reading must encode");
+  const r = buildRegisters(ONLINE);
+  assert.ok(r, "a complete online reading must encode");
+  const g = (addr: number) => r.get(addr) ?? 0;
 
-  const at = (addr: number) => decodeFloat32([regs.get(addr)!, regs.get(addr + 1)!]);
+  // Identity marker "SunS".
+  assert.equal(g(BASE), 0x5375, "SunS hi");
+  assert.equal(g(BASE + 1), 0x6e53, "SunS lo");
+  // Model headers.
+  assert.equal(g(M1_HDR), 1, "model 1 id");
+  assert.equal(g(M1_HDR + 1), 66, "model 1 len");
+  assert.equal(g(M103_HDR), 103, "model 103 id");
+  assert.equal(g(M103_HDR + 1), 50, "model 103 len");
+  // End marker after the 103 block.
+  assert.equal(g(D + 50), 0xffff, "end marker");
+  assert.equal(g(D + 51), 0, "end length");
 
-  // Active power is generation, positive, and already in watts.
-  close(at(0x2012), 2536, "Pt");
-  // Split evenly across the phases.
-  close(at(0x2014), 2536 / 3, "Pa");
-  close(at(0x2018), 2536 / 3, "Pc");
-  // Voltage /10, current /100, frequency /100.
-  close(at(0x2006), 232.1, "Ua");
-  close(at(0x200a), 232.8, "Uc");
-  close(at(0x200c), 3.74, "Ia");
-  close(at(0x2044), 49.98, "Freq");
-  // Import energy is lifetime production, /100 -> kWh. Export is 0.
-  close(at(0x101e), 22114.53, "Imp_EP");
-  close(at(0x1028), 0, "Exp_EP");
-  // Inverters run at unity power factor and produce no reactive power.
-  close(at(0x202a), 1, "PFt");
-  close(at(0x201a), 0, "Qt");
-  // Apparent power equals active power at PF 1.
-  close(at(0x2022), 2536, "St");
+  // Decoded values (int16 x 10^SF).
+  close(sf(g(D + P.W), g(D + P.W_SF)), 2536, "W");
+  close(sf(g(D + P.Hz), g(D + P.Hz_SF)), 49.98, "Hz");
+  close(sf(g(D + P.PhVphA), g(D + P.V_SF)), 232.1, "PhVphA");
+  close(sf(g(D + P.AphA), g(D + P.A_SF)), 3.74, "AphA");
+  // Lifetime energy: acc32 Wh, SF 0 -> 22114.53 kWh.
+  close(
+    accSf(g(D + P.WH), g(D + P.WH + 1), g(D + P.WH_SF)) / 1000,
+    22114.53,
+    "WH",
+  );
+  assert.equal(g(D + P.St), 4, "operating state = MPPT");
 
-  // An offline reading must not encode: serving zeros would report a healthy
-  // inverter producing nothing.
+  // An offline reading must not encode.
   assert.equal(
     buildRegisters({ status: "Offline", grid_connected_power: "0" }),
     undefined,
     "an offline reading must not encode",
   );
-  // Nor may a reading with a missing field, which would otherwise emit NaN --
-  // the edge rejects NaN and discards the whole meter parse.
+  // Nor a reading missing a required AC field.
   const { line2_voltage, ...missingPhase } = ONLINE;
   assert.equal(
     buildRegisters(missingPhase),
@@ -89,53 +118,43 @@ function checkEncoding() {
 
 function checkStaleness() {
   resetSnapshot();
-  assert.throws(() => vector.getHoldingRegister!(0x2012, MODBUS_UNIT_ID, () => {}),
-    "with no reading at all the server must fault");
-
-  // Older than MODBUS_STALE_AFTER (3 x the 8s default poll interval).
+  assert.throws(
+    () => vector.getHoldingRegister!(BASE, MODBUS_UNIT_ID, () => {}),
+    "with no reading at all the server must fault",
+  );
   updateSnapshot(ONLINE, Date.now() - 10 * 60 * 1000);
   assert.throws(
-    () => vector.getMultipleHoldingRegisters!(0x2006, 44, MODBUS_UNIT_ID, () => {}),
+    () => vector.getMultipleHoldingRegisters!(BASE, 124, MODBUS_UNIT_ID, () => {}),
     "a stale reading must fault rather than serve old values",
   );
-
   console.log("  staleness: ok");
 }
 
 async function checkServerRoundTrip() {
-  // The server is built here rather than via startModbusServer so the check
-  // binds a test port on loopback and does not depend on the environment.
   const server = new ServerTCP(vector, {
     host: "127.0.0.1",
     port: TEST_PORT,
     unitID: MODBUS_UNIT_ID,
   });
-
   updateSnapshot(ONLINE);
 
   const client = new ModbusRTU();
   await client.connectTCP("127.0.0.1", { port: TEST_PORT });
   client.setID(MODBUS_UNIT_ID);
 
-  // Exactly the three blocks the edge coalesces its 25 registers into.
-  const energy = await client.readHoldingRegisters(0x101e, 12);
-  const electrical = await client.readHoldingRegisters(0x2006, 44);
-  const frequency = await client.readHoldingRegisters(0x2044, 2);
+  // Read the whole SunSpec device block in one request, as a driver would.
+  const res = await client.readHoldingRegisters(BASE, 124);
+  const g = (off: number) => res.data[off];
 
-  assert.equal(energy.data.length, 12, "energy block length");
-  assert.equal(electrical.data.length, 44, "electrical block length");
-  assert.equal(frequency.data.length, 2, "frequency block length");
-
-  close(decodeFloat32(energy.data.slice(0, 2)), 22114.53, "Imp_EP over the wire");
-  // Pt is at 0x2012, twelve registers into the 0x2006 block.
-  close(decodeFloat32(electrical.data.slice(12, 14)), 2536, "Pt over the wire");
-  close(decodeFloat32(frequency.data), 49.98, "Freq over the wire");
-
-  // The gap between Imp_EP and Exp_EP is unmapped and must read as 0, not fault.
-  assert.deepEqual(
-    energy.data.slice(2, 10),
-    new Array(8).fill(0),
-    "unmapped gap registers must read as 0",
+  assert.equal(g(0), 0x5375, "SunS over the wire");
+  assert.equal(g(M103_HDR - BASE), 103, "model 103 over the wire");
+  close(sf(g(D - BASE + P.W), g(D - BASE + P.W_SF)), 2536, "W over the wire");
+  close(sf(g(D - BASE + P.Hz), g(D - BASE + P.Hz_SF)), 49.98, "Hz over the wire");
+  close(
+    accSf(g(D - BASE + P.WH), g(D - BASE + P.WH + 1), g(D - BASE + P.WH_SF)) /
+      1000,
+    22114.53,
+    "WH over the wire",
   );
 
   client.close(() => {});
@@ -144,7 +163,7 @@ async function checkServerRoundTrip() {
 }
 
 async function main() {
-  console.log("saj2mqtt modbus self-check");
+  console.log("saj2mqtt sunspec self-check");
   checkEncoding();
   checkStaleness();
   await checkServerRoundTrip();
