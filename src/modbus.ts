@@ -1,5 +1,6 @@
 import { IServiceVector, ServerTCP } from "modbus-serial";
 import {
+  MODBUS_BASE_REGISTER,
   MODBUS_STALE_AFTER,
   MODBUS_TCP_HOST,
   MODBUS_TCP_PORT,
@@ -8,160 +9,215 @@ import {
 import { SAJField, SAJState } from "./types";
 
 /**
- * Serves the inverter's latest reading as a Chint DTSU666-compatible Modbus TCP
- * slave, so the E-MVP edge server can poll it as a power meter.
+ * Serves the inverter's latest reading as a SunSpec Modbus TCP device, so the
+ * E-MVP edge can poll it as a *real solar inverter* rather than a meter.
  *
- * The SAJ's eSolar module speaks HTTP only -- it has no Modbus at all (port 502
- * is closed on the inverter) -- and the edge has no SunSpec or vendor inverter
- * driver: DTSU666 is the only three-phase register vocabulary it speaks. So the
- * PV circuit is presented as a *production meter*, which is the same convention
- * the ESP32 simulator uses for its inverter slave:
+ * The SAJ's eSolar module speaks HTTP only (status.php); it has no Modbus. This
+ * synthesises the standard SunSpec register map from that HTTP data:
  *
- *   - active power is generation, positive, split evenly across the phases
- *   - import energy is cumulative lifetime production
- *   - export energy is 0 -- an inverter does not import
- *   - reactive power is 0 and power factor is 1 (inverters run near unity)
+ *   - "SunS" identity marker at the base register (default 40000)
+ *   - Model 1  (Common)   -- manufacturer / model / version / serial
+ *   - Model 103 (three-phase inverter) -- AC power/current/voltage, frequency,
+ *                             lifetime AC energy, DC power/voltage/current, temp,
+ *                             operating state. int16 values + int16 scale factors.
+ *   - End marker (model 0xFFFF, length 0)
  *
- * Register layout must match edge-server internal/modbus/dtsu666.go: every
- * value is an IEEE 754 float32 in two consecutive registers, big-endian ABCD
- * (high word first), read with FC 0x03. Writes are not served, so FC 0x10
- * returns an illegal-function exception, as on a real inverter.
+ * SunSpec 1xx models are integer + scale factor: actual = value * 10^SF. The
+ * SAJ's status.php raw values are already scaled (voltage x10, current x100,
+ * frequency x100, energy x100 kWh), which maps cleanly onto SunSpec SFs.
+ *
+ * The edge's SunSpec driver reads holding registers from the base with FC 0x03,
+ * verifies the marker, walks the model chain and decodes model 103. Writes are
+ * not served, as on a real inverter.
  */
 
-// Register addresses, all float32 pairs. Energy lives in the 0x101E block on
-// the real Chint part, not the 0x4000 block some clones use.
-const DTSU666 = {
-  IMPORT_ENERGY: 0x101e,
-  EXPORT_ENERGY: 0x1028,
-  VOLTAGE_L1: 0x2006,
-  VOLTAGE_L2: 0x2008,
-  VOLTAGE_L3: 0x200a,
-  CURRENT_L1: 0x200c,
-  CURRENT_L2: 0x200e,
-  CURRENT_L3: 0x2010,
-  POWER_TOTAL: 0x2012,
-  POWER_L1: 0x2014,
-  POWER_L2: 0x2016,
-  POWER_L3: 0x2018,
-  REACTIVE_TOTAL: 0x201a,
-  REACTIVE_L1: 0x201c,
-  REACTIVE_L2: 0x201e,
-  REACTIVE_L3: 0x2020,
-  APPARENT_TOTAL: 0x2022,
-  APPARENT_L1: 0x2024,
-  APPARENT_L2: 0x2026,
-  APPARENT_L3: 0x2028,
-  PF_TOTAL: 0x202a,
-  PF_L1: 0x202c,
-  PF_L2: 0x202e,
-  PF_L3: 0x2030,
-  FREQUENCY: 0x2044,
+// ── SunSpec model 103 (three-phase inverter) register offsets, from the first
+// data register of the block. int16/uint16 unless noted. See SunSpec Inverter
+// Model 1xx. Only the points we populate are named; the rest read as 0.
+const M103 = {
+  A: 0, // AC total current
+  AphA: 1,
+  AphB: 2,
+  AphC: 3,
+  A_SF: 4,
+  PhVphA: 8, // per-phase voltage (PPVph* line-line at 5..7 left 0)
+  PhVphB: 9,
+  PhVphC: 10,
+  V_SF: 11,
+  W: 12, // AC power
+  W_SF: 13,
+  Hz: 14,
+  Hz_SF: 15,
+  WH: 22, // AC lifetime energy, acc32 (22..23)
+  WH_SF: 24,
+  DCA: 25,
+  DCA_SF: 26,
+  DCV: 27,
+  DCV_SF: 28,
+  DCW: 29,
+  DCW_SF: 30,
+  TmpCab: 31,
+  Tmp_SF: 35,
+  St: 36, // operating state
 } as const;
+const M103_LEN = 50;
+const M1_LEN = 66; // Common model fixed length
 
-// status.php returns raw scaled integers; these divisors turn them into the
-// engineering units the DTSU666 registers carry.
-const SCALE = {
-  VOLTAGE: 10, // 2321 -> 232.1 V
-  CURRENT: 100, // 374 -> 3.74 A
-  FREQUENCY: 100, // 4998 -> 49.98 Hz
-  ENERGY: 100, // 2211453 -> 22114.53 kWh
-} as const;
+// SunSpec operating state: 4 = MPPT (normally producing).
+const ST_MPPT = 4;
 
-/** Splits a float32 into its two 16-bit registers, high word first (ABCD). */
-function float32Words(value: number): [number, number] {
-  const buf = Buffer.alloc(4);
-  buf.writeFloatBE(value, 0);
-  return [buf.readUInt16BE(0), buf.readUInt16BE(2)];
+// ── low-level register writers. The snapshot map is address -> uint16.
+function put16(map: Map<number, number>, addr: number, value: number): void {
+  map.set(addr, value & 0xffff);
+}
+/** Signed 16-bit (two's complement). */
+function putI16(map: Map<number, number>, addr: number, value: number): void {
+  put16(map, addr, Math.round(value) & 0xffff);
+}
+/** Unsigned 32-bit accumulator across two registers, high word first. */
+function putAcc32(map: Map<number, number>, addr: number, value: number): void {
+  const v = Math.max(0, Math.round(value)) >>> 0;
+  put16(map, addr, (v >>> 16) & 0xffff);
+  put16(map, addr + 1, v & 0xffff);
+}
+/** ASCII into `regs` registers, 2 chars/register, null-padded (SunSpec strings). */
+function putString(
+  map: Map<number, number>,
+  addr: number,
+  str: string,
+  regs: number,
+): void {
+  const bytes = Buffer.alloc(regs * 2); // zero-filled
+  Buffer.from(str, "ascii").copy(bytes, 0, 0, Math.min(str.length, regs * 2));
+  for (let i = 0; i < regs; i++) put16(map, addr + i, bytes.readUInt16BE(i * 2));
 }
 
 /**
- * Encodes a reading into an address -> register-value map.
+ * Encodes a reading into an absolute-address -> register map, laid out as a
+ * SunSpec device starting at MODBUS_BASE_REGISTER.
  *
- * Returns undefined when the reading is not usable, which keeps the previous
- * good snapshot in place instead of serving zeros: the edge rejects NaN outright
- * and aborts the whole meter parse, and a silent 0 W would report a healthy
- * inverter producing nothing rather than a fault.
+ * Returns undefined when the reading is not usable (inverter Offline or a
+ * required AC field missing), which keeps the previous good snapshot in place
+ * instead of serving zeros -- the edge rejects a fault and reports a comms
+ * failure rather than a healthy inverter producing nothing.
  */
 export function buildRegisters(state: SAJState): Map<number, number> | undefined {
-  if (state.status !== "Online") {
-    return undefined;
-  }
+  if (state.status !== "Online") return undefined;
 
   let complete = true;
-  const scaled = (field: SAJField, divisor: number): number => {
+  const num = (field: SAJField): number => {
     const raw = Number(state[field]);
     if (!Number.isFinite(raw)) {
       complete = false;
       return 0;
     }
-    return raw / divisor;
+    return raw;
+  };
+  // optional() never marks the reading incomplete -- DC/temp are enrichment.
+  const optional = (field: SAJField): number => {
+    const raw = Number(state[field]);
+    return Number.isFinite(raw) ? raw : 0;
   };
 
-  const voltage = [
-    scaled(SAJField.LINE1_VOLTAGE, SCALE.VOLTAGE),
-    scaled(SAJField.LINE2_VOLTAGE, SCALE.VOLTAGE),
-    scaled(SAJField.LINE3_VOLTAGE, SCALE.VOLTAGE),
+  // status.php raw values (already scaled): voltage x10, current x100,
+  // frequency x100, energy x100 (kWh), power in W.
+  const vRaw = [
+    num(SAJField.LINE1_VOLTAGE),
+    num(SAJField.LINE2_VOLTAGE),
+    num(SAJField.LINE3_VOLTAGE),
   ];
-  const current = [
-    scaled(SAJField.LINE1_CURRENT, SCALE.CURRENT),
-    scaled(SAJField.LINE2_CURRENT, SCALE.CURRENT),
-    scaled(SAJField.LINE3_CURRENT, SCALE.CURRENT),
+  const aRaw = [
+    num(SAJField.LINE1_CURRENT),
+    num(SAJField.LINE2_CURRENT),
+    num(SAJField.LINE3_CURRENT),
   ];
-  // grid_connected_power is already in watts.
-  const powerW = scaled(SAJField.GRID_CONNECTED_POWER, 1);
-  const frequencyHz = scaled(SAJField.GRID_CONNECTED_FREQUENCY, SCALE.FREQUENCY);
-  const producedKWh = scaled(SAJField.TOTAL_GENERATED, SCALE.ENERGY);
+  const powerW = num(SAJField.GRID_CONNECTED_POWER); // already watts
+  const freqRaw = num(SAJField.GRID_CONNECTED_FREQUENCY); // x100
+  const energyRaw = num(SAJField.TOTAL_GENERATED); // x100 kWh
+  if (!complete) return undefined;
 
-  if (!complete) {
-    return undefined;
-  }
+  // DC side (per-string), enrichment only. status raw: PV voltage x10, current x100.
+  const pv = [
+    [optional(SAJField.PV1_VOLTAGE), optional(SAJField.PV1_CURRENT)],
+    [optional(SAJField.PV2_VOLTAGE), optional(SAJField.PV2_CURRENT)],
+  ];
+  const dcWatts = pv.reduce((sum, [v, i]) => sum + (v / 10) * (i / 100), 0);
+  const dcvRaw = pv[0][0] || pv[1][0]; // representative string voltage (x10)
+  const tempRaw = optional(SAJField.DEVICE_TEMPERATURE); // x10
 
-  // Per-phase power is an even split rather than V*I: the measured phase
-  // products sum to more than the reported AC total (power factor is not
-  // actually unity), so splitting Pt keeps the phases consistent with it.
-  const phasePowerW = powerW / 3;
+  const base = MODBUS_BASE_REGISTER;
+  const map = new Map<number, number>();
 
-  const registers = new Map<number, number>();
-  const put = (address: number, value: number) => {
-    const [high, low] = float32Words(value);
-    registers.set(address, high);
-    registers.set(address + 1, low);
-  };
+  // Identity marker "SunS" = 0x53756E53.
+  put16(map, base, 0x5375);
+  put16(map, base + 1, 0x6e53);
 
-  put(DTSU666.VOLTAGE_L1, voltage[0]);
-  put(DTSU666.VOLTAGE_L2, voltage[1]);
-  put(DTSU666.VOLTAGE_L3, voltage[2]);
-  put(DTSU666.CURRENT_L1, current[0]);
-  put(DTSU666.CURRENT_L2, current[1]);
-  put(DTSU666.CURRENT_L3, current[2]);
+  // ── Model 1 (Common). Header then fixed 66-register block.
+  const m1 = base + 2;
+  put16(map, m1, 1);
+  put16(map, m1 + 1, M1_LEN);
+  const m1Data = m1 + 2;
+  putString(map, m1Data + 0, "SAJ", 16); // Mn manufacturer
+  putString(map, m1Data + 16, "saj2mqtt", 16); // Md model
+  putString(map, m1Data + 40, "1", 8); // Vr version (Opt[8] at 32..39 left blank)
+  putString(map, m1Data + 48, "", 16); // SN serial (unknown from status.php)
+  put16(map, m1Data + 64, MODBUS_UNIT_ID); // DA device address (65 = pad, left 0)
 
-  put(DTSU666.POWER_TOTAL, powerW);
-  put(DTSU666.POWER_L1, phasePowerW);
-  put(DTSU666.POWER_L2, phasePowerW);
-  put(DTSU666.POWER_L3, phasePowerW);
+  // ── Model 103 (three-phase inverter). Header then 50-register block.
+  const m103 = m1Data + M1_LEN; // = m1 + 2 + 66
+  put16(map, m103, 103);
+  put16(map, m103 + 1, M103_LEN);
+  const d = m103 + 2;
+  const at = (off: number) => d + off;
 
-  put(DTSU666.REACTIVE_TOTAL, 0);
-  put(DTSU666.REACTIVE_L1, 0);
-  put(DTSU666.REACTIVE_L2, 0);
-  put(DTSU666.REACTIVE_L3, 0);
+  // AC current: raw is x100 -> SF -2.
+  putI16(map, at(M103.A_SF), -2);
+  putI16(map, at(M103.AphA), aRaw[0]);
+  putI16(map, at(M103.AphB), aRaw[1]);
+  putI16(map, at(M103.AphC), aRaw[2]);
+  putI16(map, at(M103.A), aRaw[0] + aRaw[1] + aRaw[2]);
 
-  // Power factor is 1, so apparent power equals active power.
-  put(DTSU666.APPARENT_TOTAL, powerW);
-  put(DTSU666.APPARENT_L1, phasePowerW);
-  put(DTSU666.APPARENT_L2, phasePowerW);
-  put(DTSU666.APPARENT_L3, phasePowerW);
+  // AC voltage: raw is x10 -> SF -1.
+  putI16(map, at(M103.V_SF), -1);
+  putI16(map, at(M103.PhVphA), vRaw[0]);
+  putI16(map, at(M103.PhVphB), vRaw[1]);
+  putI16(map, at(M103.PhVphC), vRaw[2]);
 
-  put(DTSU666.PF_TOTAL, 1);
-  put(DTSU666.PF_L1, 1);
-  put(DTSU666.PF_L2, 1);
-  put(DTSU666.PF_L3, 1);
+  // AC power: already watts -> SF 0. (4 kW inverter fits int16; larger models
+  // would need W_SF>0. ponytail: SF 0 is fine here, revisit if W can exceed 32k.)
+  putI16(map, at(M103.W_SF), 0);
+  putI16(map, at(M103.W), powerW);
 
-  put(DTSU666.FREQUENCY, frequencyHz);
+  // Frequency: raw x100 -> SF -2.
+  putI16(map, at(M103.Hz_SF), -2);
+  putI16(map, at(M103.Hz), freqRaw);
 
-  put(DTSU666.IMPORT_ENERGY, producedKWh);
-  put(DTSU666.EXPORT_ENERGY, 0);
+  // Lifetime AC energy: raw is x100 kWh; Wh = raw * 10. acc32, SF 0.
+  putI16(map, at(M103.WH_SF), 0);
+  putAcc32(map, at(M103.WH), energyRaw * 10);
 
-  return registers;
+  // DC: report aggregate DC power (accurate) with a representative voltage, and
+  // a current derived to keep V*A consistent with W. SF: V x10 -> -1, A -> -2.
+  putI16(map, at(M103.DCW_SF), 0);
+  putI16(map, at(M103.DCW), dcWatts);
+  putI16(map, at(M103.DCV_SF), -1);
+  putI16(map, at(M103.DCV), dcvRaw);
+  putI16(map, at(M103.DCA_SF), -2);
+  putI16(map, at(M103.DCA), dcvRaw > 0 ? (dcWatts / (dcvRaw / 10)) * 100 : 0);
+
+  // Cabinet temperature: raw x10 -> SF -1.
+  putI16(map, at(M103.Tmp_SF), -1);
+  putI16(map, at(M103.TmpCab), tempRaw);
+
+  // Operating state: Online + serving => MPPT.
+  put16(map, at(M103.St), ST_MPPT);
+
+  // ── End marker.
+  const end = d + M103_LEN;
+  put16(map, end, 0xffff);
+  put16(map, end + 1, 0);
+
+  return map;
 }
 
 let snapshot: { registers: Map<number, number>; at: number } | undefined;
@@ -185,14 +241,13 @@ export function resetSnapshot(): void {
 }
 
 /**
- * Reads a register block. Unmapped addresses inside a block read as 0 -- the
- * edge coalesces its 25 registers into three ranges (0x101E+12, 0x2006+44,
- * 0x2044+2) and errors if any single one is missing, so every address in those
- * ranges has to answer.
+ * Reads a register block. Unmapped addresses inside the SunSpec map read as 0
+ * (the reserved/unused SunSpec points), so a client scanning the whole device
+ * gets a well-formed map.
  *
- * Throws when there is no fresh reading, which the server turns into Modbus
- * exception 0x04. That is deliberate: it drives the edge's existing
- * meter_communication_failure path instead of reporting a false 0 W.
+ * Throws when there is no fresh reading, which the server turns into a Modbus
+ * exception. That drives the edge's communication-failure path instead of
+ * reporting a false 0 W.
  */
 function readBlock(address: number, length: number, now = Date.now()): number[] {
   if (!snapshot) {
@@ -230,7 +285,8 @@ export function startModbusServer(): ServerTCP {
   server.on("serverError", (err) => console.error(`Modbus server error: ${err}`));
 
   console.log(
-    `Modbus TCP (DTSU666-compatible) listening on ${MODBUS_TCP_HOST}:${MODBUS_TCP_PORT}, unit ${MODBUS_UNIT_ID}`,
+    `Modbus TCP (SunSpec) listening on ${MODBUS_TCP_HOST}:${MODBUS_TCP_PORT}, ` +
+      `unit ${MODBUS_UNIT_ID}, base register ${MODBUS_BASE_REGISTER}`,
   );
   return server;
 }
