@@ -33,7 +33,7 @@ const ONLINE: SAJState = {
 const M1_HDR = BASE + 2; // Common model header
 const M64001_HDR = BASE + 2 + 2 + 66; // after marker(2)+m1 hdr(2)+m1 data(66)
 const V = M64001_HDR + 2; // private model data start
-const M103_HDR = V + 11; // model 103 sits AFTER the private model
+const M103_HDR = V + 14; // model 103 sits AFTER the private model
 const D = M103_HDR + 2; // model 103 data start
 // Private model 64001 point offsets within its data block.
 const Q = {
@@ -45,9 +45,14 @@ const Q = {
   RunHours: 6,
   CO2Kg: 8,
   Frac_SF: 10,
+  PV1A: 11,
+  PV2A: 12,
+  A_SF: 13,
 } as const;
 // The single FC03 read the edge issues: 125 registers reaches model 103's St
-// point (BASE+121) with the private model spliced in ahead of it.
+// point with the private model spliced in ahead of it. With the private model
+// at its full 14 registers St lands on BASE+124 -- the LAST register of the
+// block, zero slack. The assertion below is the tripwire for growing it again.
 const EDGE_BLOCK = 125;
 // Model 103 point offsets within the data block.
 const P = {
@@ -97,7 +102,7 @@ function checkEncoding() {
   assert.equal(g(M1_HDR), 1, "model 1 id");
   assert.equal(g(M1_HDR + 1), 66, "model 1 len");
   assert.equal(g(M64001_HDR), 64001, "model 64001 id");
-  assert.equal(g(M64001_HDR + 1), 11, "model 64001 len");
+  assert.equal(g(M64001_HDR + 1), 14, "model 64001 len");
   assert.equal(g(M103_HDR), 103, "model 103 id");
   assert.equal(g(M103_HDR + 1), 50, "model 103 len");
   // End marker after the 103 block.
@@ -116,6 +121,13 @@ function checkEncoding() {
   // it must encode as 0 rather than being treated as absent.
   close(sf(g(V + Q.PV2V), g(V + Q.V_SF)), 0, "PV2 voltage");
   close(sf(g(V + Q.BusV), g(V + Q.V_SF)), 626.7, "bus voltage");
+  // Per-string current. Until these were emitted the edge could see a string's
+  // voltage but never its power, so per-MPPT energy was not derivable at all.
+  // 279.7 V x 9.51 A = 2659.9 W DC against 2536 W AC on this same capture --
+  // a 95.4% conversion, which is the sanity check that the scaling is right.
+  close(sf(g(V + Q.PV1A), g(V + Q.A_SF)), 9.51, "PV1 current");
+  // As with PV2 voltage, 0 A is a real reading and must encode as 0.
+  close(sf(g(V + Q.PV2A), g(V + Q.A_SF)), 0, "PV2 current");
   close(acc32(g(V + Q.TodayWh), g(V + Q.TodayWh + 1)) / 1000, 6.99, "today kWh");
   // Both overflow uint16 on a real device, hence uint32 + a shared SF.
   close(
@@ -202,6 +214,11 @@ async function checkServerRoundTrip() {
     sf(g(V - BASE + Q.BusV), g(V - BASE + Q.V_SF)),
     626.7,
     "bus voltage over the wire",
+  );
+  close(
+    sf(g(V - BASE + Q.PV1A), g(V - BASE + Q.A_SF)),
+    9.51,
+    "PV1 current over the wire",
   );
   close(sf(g(D - BASE + P.W), g(D - BASE + P.W_SF)), 2536, "W over the wire");
   close(sf(g(D - BASE + P.Hz), g(D - BASE + P.Hz_SF)), 49.98, "Hz over the wire");
