@@ -31,8 +31,24 @@ const ONLINE: SAJState = {
 
 // SunSpec device layout offsets from BASE.
 const M1_HDR = BASE + 2; // Common model header
-const M103_HDR = BASE + 2 + 2 + 66; // after marker(2)+m1 hdr(2)+m1 data(66)
+const M64001_HDR = BASE + 2 + 2 + 66; // after marker(2)+m1 hdr(2)+m1 data(66)
+const V = M64001_HDR + 2; // private model data start
+const M103_HDR = V + 11; // model 103 sits AFTER the private model
 const D = M103_HDR + 2; // model 103 data start
+// Private model 64001 point offsets within its data block.
+const Q = {
+  PV1V: 0,
+  PV2V: 1,
+  BusV: 2,
+  V_SF: 3,
+  TodayWh: 4,
+  RunHours: 6,
+  CO2Kg: 8,
+  Frac_SF: 10,
+} as const;
+// The single FC03 read the edge issues: 125 registers reaches model 103's St
+// point (BASE+121) with the private model spliced in ahead of it.
+const EDGE_BLOCK = 125;
 // Model 103 point offsets within the data block.
 const P = {
   AphA: 1,
@@ -80,11 +96,38 @@ function checkEncoding() {
   // Model headers.
   assert.equal(g(M1_HDR), 1, "model 1 id");
   assert.equal(g(M1_HDR + 1), 66, "model 1 len");
+  assert.equal(g(M64001_HDR), 64001, "model 64001 id");
+  assert.equal(g(M64001_HDR + 1), 11, "model 64001 len");
   assert.equal(g(M103_HDR), 103, "model 103 id");
   assert.equal(g(M103_HDR + 1), 50, "model 103 len");
   // End marker after the 103 block.
   assert.equal(g(D + 50), 0xffff, "end marker");
   assert.equal(g(D + 51), 0, "end length");
+  // Model 103's St must stay inside the edge's single FC03 read, which is the
+  // whole reason the private model goes before 103 rather than after it.
+  assert.ok(
+    D + P.St < BASE + EDGE_BLOCK,
+    `model 103 St at ${D + P.St - BASE} must be within the ${EDGE_BLOCK}-register block`,
+  );
+
+  // Private model 64001 values.
+  close(sf(g(V + Q.PV1V), g(V + Q.V_SF)), 279.7, "PV1 voltage");
+  // 0 V on string 2 is a real reading (night, or a single-string install), so
+  // it must encode as 0 rather than being treated as absent.
+  close(sf(g(V + Q.PV2V), g(V + Q.V_SF)), 0, "PV2 voltage");
+  close(sf(g(V + Q.BusV), g(V + Q.V_SF)), 626.7, "bus voltage");
+  close(acc32(g(V + Q.TodayWh), g(V + Q.TodayWh + 1)) / 1000, 6.99, "today kWh");
+  // Both overflow uint16 on a real device, hence uint32 + a shared SF.
+  close(
+    accSf(g(V + Q.RunHours), g(V + Q.RunHours + 1), g(V + Q.Frac_SF)),
+    19051.2,
+    "running hours",
+  );
+  close(
+    accSf(g(V + Q.CO2Kg), g(V + Q.CO2Kg + 1), g(V + Q.Frac_SF)),
+    17359.9,
+    "CO2 reduction",
+  );
 
   // Decoded values (int16 x 10^SF).
   close(sf(g(D + P.W), g(D + P.W_SF)), 2536, "W");
@@ -124,7 +167,13 @@ function checkStaleness() {
   );
   updateSnapshot(ONLINE, Date.now() - 10 * 60 * 1000);
   assert.throws(
-    () => vector.getMultipleHoldingRegisters!(BASE, 124, MODBUS_UNIT_ID, () => {}),
+    () =>
+      vector.getMultipleHoldingRegisters!(
+        BASE,
+        EDGE_BLOCK,
+        MODBUS_UNIT_ID,
+        () => {},
+      ),
     "a stale reading must fault rather than serve old values",
   );
   console.log("  staleness: ok");
@@ -143,11 +192,17 @@ async function checkServerRoundTrip() {
   client.setID(MODBUS_UNIT_ID);
 
   // Read the whole SunSpec device block in one request, as a driver would.
-  const res = await client.readHoldingRegisters(BASE, 124);
+  const res = await client.readHoldingRegisters(BASE, EDGE_BLOCK);
   const g = (off: number) => res.data[off];
 
   assert.equal(g(0), 0x5375, "SunS over the wire");
+  assert.equal(g(M64001_HDR - BASE), 64001, "model 64001 over the wire");
   assert.equal(g(M103_HDR - BASE), 103, "model 103 over the wire");
+  close(
+    sf(g(V - BASE + Q.BusV), g(V - BASE + Q.V_SF)),
+    626.7,
+    "bus voltage over the wire",
+  );
   close(sf(g(D - BASE + P.W), g(D - BASE + P.W_SF)), 2536, "W over the wire");
   close(sf(g(D - BASE + P.Hz), g(D - BASE + P.Hz_SF)), 49.98, "Hz over the wire");
   close(
