@@ -17,6 +17,10 @@ import { SAJField, SAJState } from "./types";
  *
  *   - "SunS" identity marker at the base register (default 40000)
  *   - Model 1  (Common)   -- manufacturer / model / version / serial
+ *   - Model 64001 (private) -- the quantities the SAJ reports but model 103 has
+ *                             no points for: PV1/PV2 and DC bus voltage, today's
+ *                             energy, total running hours, CO2 reduction. Ours,
+ *                             so it only exists on a saj2mqtt-fronted inverter.
  *   - Model 103 (three-phase inverter) -- AC power/current/voltage, frequency,
  *                             lifetime AC energy, DC power/voltage/current, temp,
  *                             operating state. int16 values + int16 scale factors.
@@ -62,6 +66,32 @@ const M103 = {
 } as const;
 const M103_LEN = 50;
 const M1_LEN = 66; // Common model fixed length
+
+// ── Private model 64001 (SunSpec reserves >=64000 for vendors). Carries the
+// six quantities status.php reports that model 103 cannot express. Same
+// integer + scale-factor convention as the 1xx models, so the edge decodes it
+// with the same helpers.
+//
+// It is placed BEFORE model 103 in the chain, which reads oddly but is what
+// keeps the whole device inside a single FC03 read: appending it after 103
+// would push 103's St point past the 125-register limit and cost the edge a
+// second Modbus request every poll.
+//
+// ponytail: 11 data registers, sized to fit. It may grow to 14 before model
+// 103's St falls outside the edge's 125-register block -- past that, either
+// the edge reads two blocks or this model moves after 103.
+const M64001 = {
+  PV1V: 0, // PV string 1 voltage
+  PV2V: 1, // PV string 2 voltage
+  BusV: 2, // DC bus voltage
+  V_SF: 3, // scale factor shared by the three voltages above
+  TodayWh: 4, // energy generated today, acc32 (4..5), Wh
+  RunHours: 6, // total running time, uint32 (6..7)
+  CO2Kg: 8, // lifetime CO2 reduction, uint32 (8..9)
+  Frac_SF: 10, // scale factor shared by RunHours and CO2Kg
+} as const;
+const M64001_ID = 64001;
+const M64001_LEN = 11;
 
 // SunSpec operating state: 4 = MPPT (normally producing).
 const ST_MPPT = 4;
@@ -145,6 +175,15 @@ export function buildRegisters(state: SAJState): Map<number, number> | undefined
   const dcvRaw = pv[0][0] || pv[1][0]; // representative string voltage (x10)
   const tempRaw = optional(SAJField.DEVICE_TEMPERATURE); // x10
 
+  // Private-model values. optional(), not num(): the SAJ dropping one of these
+  // must not discard an otherwise good AC reading.
+  const pv1vRaw = optional(SAJField.PV1_VOLTAGE); // x10
+  const pv2vRaw = optional(SAJField.PV2_VOLTAGE); // x10 -- legitimately 0 at night
+  const busvRaw = optional(SAJField.BUS_VOLTAGE); // x10
+  const todayRaw = optional(SAJField.TODAY_GENERATED); // x100 kWh
+  const runHoursRaw = optional(SAJField.TOTAL_RUNNING_TIME); // x10 h
+  const co2Raw = optional(SAJField.CO2_EMISSION_REDUCTION); // x10 kg
+
   const base = MODBUS_BASE_REGISTER;
   const map = new Map<number, number>();
 
@@ -163,8 +202,31 @@ export function buildRegisters(state: SAJState): Map<number, number> | undefined
   putString(map, m1Data + 48, "", 16); // SN serial (unknown from status.php)
   put16(map, m1Data + 64, MODBUS_UNIT_ID); // DA device address (65 = pad, left 0)
 
+  // ── Model 64001 (private). Header then 11-register block.
+  const m64001 = m1Data + M1_LEN; // = m1 + 2 + 66
+  put16(map, m64001, M64001_ID);
+  put16(map, m64001 + 1, M64001_LEN);
+  const vd = m64001 + 2;
+  const vAt = (off: number) => vd + off;
+
+  // The three voltages are raw x10 -> SF -1.
+  putI16(map, vAt(M64001.V_SF), -1);
+  put16(map, vAt(M64001.PV1V), pv1vRaw);
+  put16(map, vAt(M64001.PV2V), pv2vRaw);
+  put16(map, vAt(M64001.BusV), busvRaw);
+
+  // Today's energy: raw is x100 kWh; Wh = raw * 10. acc32, unscaled, matching
+  // how model 103 reports the lifetime figure.
+  putAcc32(map, vAt(M64001.TodayWh), todayRaw * 10);
+
+  // Running hours and CO2 both overflow uint16 (190512, 173599 on a real
+  // device), so both are uint32; both are raw x10 -> SF -1.
+  putI16(map, vAt(M64001.Frac_SF), -1);
+  putAcc32(map, vAt(M64001.RunHours), runHoursRaw);
+  putAcc32(map, vAt(M64001.CO2Kg), co2Raw);
+
   // ── Model 103 (three-phase inverter). Header then 50-register block.
-  const m103 = m1Data + M1_LEN; // = m1 + 2 + 66
+  const m103 = vd + M64001_LEN;
   put16(map, m103, 103);
   put16(map, m103 + 1, M103_LEN);
   const d = m103 + 2;
