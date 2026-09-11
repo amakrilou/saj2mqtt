@@ -77,9 +77,10 @@ const M1_LEN = 66; // Common model fixed length
 // would push 103's St point past the 125-register limit and cost the edge a
 // second Modbus request every poll.
 //
-// ponytail: 11 data registers, sized to fit. It may grow to 14 before model
-// 103's St falls outside the edge's 125-register block -- past that, either
-// the edge reads two blocks or this model moves after 103.
+// ponytail: 14 data registers -- AT the ceiling, not approaching it. Model
+// 103's St now lands on base+124, the last register of the edge's 125-register
+// block. Any further point ahead of 103 forces either a second Modbus read on
+// the edge or moving this model after 103.
 const M64001 = {
   PV1V: 0, // PV string 1 voltage
   PV2V: 1, // PV string 2 voltage
@@ -89,9 +90,12 @@ const M64001 = {
   RunHours: 6, // total running time, uint32 (6..7)
   CO2Kg: 8, // lifetime CO2 reduction, uint32 (8..9)
   Frac_SF: 10, // scale factor shared by RunHours and CO2Kg
+  PV1A: 11, // PV string 1 current
+  PV2A: 12, // PV string 2 current
+  A_SF: 13, // scale factor shared by the two currents above
 } as const;
 const M64001_ID = 64001;
-const M64001_LEN = 11;
+const M64001_LEN = 14;
 
 // SunSpec operating state: 4 = MPPT (normally producing).
 const ST_MPPT = 4;
@@ -202,7 +206,7 @@ export function buildRegisters(state: SAJState): Map<number, number> | undefined
   putString(map, m1Data + 48, "", 16); // SN serial (unknown from status.php)
   put16(map, m1Data + 64, MODBUS_UNIT_ID); // DA device address (65 = pad, left 0)
 
-  // ── Model 64001 (private). Header then 11-register block.
+  // ── Model 64001 (private). Header then 14-register block.
   const m64001 = m1Data + M1_LEN; // = m1 + 2 + 66
   put16(map, m64001, M64001_ID);
   put16(map, m64001 + 1, M64001_LEN);
@@ -224,6 +228,15 @@ export function buildRegisters(state: SAJState): Map<number, number> | undefined
   putI16(map, vAt(M64001.Frac_SF), -1);
   putAcc32(map, vAt(M64001.RunHours), runHoursRaw);
   putAcc32(map, vAt(M64001.CO2Kg), co2Raw);
+
+  // Per-string current, raw x100 -> SF -2, same convention as model 103's A_SF.
+  // These are the values dcWatts is computed from above -- until now they were
+  // folded into that aggregate and discarded, which left the edge unable to
+  // derive per-string power. put16, not putI16: PV string current is never
+  // negative. A string idle at night reads a true 0.
+  putI16(map, vAt(M64001.A_SF), -2);
+  put16(map, vAt(M64001.PV1A), pv[0][1]);
+  put16(map, vAt(M64001.PV2A), pv[1][1]);
 
   // ── Model 103 (three-phase inverter). Header then 50-register block.
   const m103 = vd + M64001_LEN;
